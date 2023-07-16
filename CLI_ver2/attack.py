@@ -7,6 +7,7 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.data.dataset import TensorDataset
 from torch.utils.data.sampler import SubsetRandomSampler
+from torch.utils.data import DataLoader, TensorDataset, Dataset
 import model
 from model import init_params as w_init
 from train import  prepare_attack_data, train_model, train_attack_model, get_feature_representation
@@ -21,9 +22,14 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import sys
 
+from sklearn.model_selection import train_test_split
+
 sys.path.insert(1, 'ModelInversion')
 import ModelInversion.model_inversion as mn
 import ModelInversion.target_model as target
+
+from unlearnkde import unlearning
+from unlearnkde import accuracy
 
 
 #set the seed for reproducibility
@@ -823,22 +829,123 @@ def test_attack_pretrained_target(attack_type,
 
          
     else:
-        targetmodel.load_state_dict(torch.load(target_model_path))
+
+       # Create attack model inputs and outputs
         t_trainX, t_trainY = prepare_attack_data(targetmodel,target_loader,device)
         t_testX, t_testY = prepare_attack_data(targetmodel,test_loader,device,test_dataset=True)
         attackX = t_trainX + t_testX
         attackY = t_trainY + t_testY
+        input_size = attackX[0].size(1)        
 
-        input_size = attackX[0].size(1)
-        print('Input Feature dim for Attack Model : [{}]'.format(input_size))
-
-        #Instantiate model class
+        #Instantiate attack model
+        targetmodel.load_state_dict(torch.load(target_model_path))
         attack_model = model.AttackMLP(input_size,n_hidden,out_classes).to(device)
-        #Load state dict
         attack_model.load_state_dict(torch.load(attack_model_path))
 
-        #Test Attack
+        # Test Attack on the target model with train and test data
         test_attack(attack_type,attack_model, attackX, attackY, device)
+
+        # split train data into retain and forget
+        data_list = []
+        target_list = []
+
+        # Convert DataLoader back to list of Dataset
+        for data, target in target_loader:
+            data_list.append(data)
+            target_list.append(target)
+
+        # Convert lists to a single Dataset
+        total_dataset = torch.utils.data.TensorDataset(torch.cat(data_list), torch.cat(target_list))
+
+        # Get the lengths of each split
+        lengths = [int(len(total_dataset)*0.9), len(total_dataset) - int(len(total_dataset)*0.9)]
+
+        # Use random_split to split the Dataset into two random (non-overlapping) datasets
+        retain_set, forget_set = torch.utils.data.random_split(total_dataset, lengths)
+
+        # Create new DataLoaders
+        retain_loader = torch.utils.data.DataLoader(retain_set, batch_size=target_loader.batch_size, shuffle=True)
+        forget_loader = torch.utils.data.DataLoader(forget_set, batch_size=target_loader.batch_size, shuffle=True)
+
+        # get pretrain accuracy on each dataset
+        pretrain_acc = {}
+        pretrain_acc["retain"] = 100.0 * accuracy(targetmodel, retain_loader)
+        pretrain_acc["test"] = 100.0 * accuracy(targetmodel, test_loader)
+        pretrain_acc["forget"] = 100.0 * accuracy(targetmodel, forget_loader)
+
+        # Create attack model inputs and outputs
+        t_trainX, t_trainY = prepare_attack_data(targetmodel,forget_loader,device)
+        t_testX, t_testY = prepare_attack_data(targetmodel,test_loader,device,test_dataset=True)
+        attackX = t_trainX + t_testX
+        attackY = t_trainY + t_testY
+
+        #Test Attack on base model with forget and test data        
+        print("Testing Attack on base model with forget and test data")
+        test_attack(attack_type,attack_model, attackX, attackY, device)      
+
+        # test on retain and test data
+        t_trainX, t_trainY = prepare_attack_data(targetmodel,retain_loader,device)
+        t_testX, t_testY = prepare_attack_data(targetmodel,test_loader,device,test_dataset=True)
+        attackX = t_trainX + t_testX
+        attackY = t_trainY + t_testY
+        print("Testing Attack on base model with retain and test data")
+        test_attack(attack_type,attack_model, attackX, attackY, device)              
+
+        # now fine tune our unlearning model
+        model_ft = unlearning( targetmodel, retain_loader, forget_loader, test_loader )
+
+        # get fine tune accuracy on each dataset
+        ft_acc = {}
+        ft_acc["retain"] = 100.0 * accuracy(model_ft, retain_loader)
+        ft_acc["test"] = 100.0 * accuracy(model_ft, test_loader)
+        ft_acc["forget"] = 100.0 * accuracy(model_ft, forget_loader)
+
+        #Test attack on ft model
+        t_trainX, t_trainY = prepare_attack_data(model_ft,forget_loader,device)
+        t_testX, t_testY = prepare_attack_data(model_ft,test_loader,device,test_dataset=True)
+        attackX = t_trainX + t_testX
+        attackY = t_trainY + t_testY
+
+        #Test Attack on base model with forget and test data
+        print("Testing Attack on fine tuned model with forget and test data")
+        test_attack(attack_type,attack_model, attackX, attackY, device)
+
+        # print accuracies
+        print("Pretrain Accuracies")
+        print(pretrain_acc)
+        print("Fine Tune Accuracies")
+        print(ft_acc)
+
+        # finally, plot accuracies
+        import matplotlib.pyplot as plt
+
+        # Labels for our x-axis
+        labels = ['Retain', 'Forget', 'Test']
+
+        # Accuracy values
+        ft_acc_values = [ft_acc["retain"], ft_acc["forget"], ft_acc["test"]]
+        pretrain_acc_values = [pretrain_acc["retain"], pretrain_acc["forget"], pretrain_acc["test"]]
+
+        # Bar width
+        bar_width = 0.35
+
+        # Positions of the left bar boundaries
+        r1 = np.arange(len(ft_acc_values))
+
+        # Positions of the right bar boundaries
+        r2 = [x + bar_width for x in r1]
+
+        # Creating the bar plot
+        plt.bar(r1, pretrain_acc_values, color='lightblue', width=bar_width, edgecolor='grey', label='Pretrained Model')
+        plt.bar(r2, ft_acc_values, color='salmon', width=bar_width, edgecolor='grey', label='Fine-tuned Model')
+
+        # Adding labels
+        plt.xlabel('Data', fontweight='bold')
+        plt.ylabel('Accuracy (%)', fontweight='bold')
+        plt.xticks([r + bar_width for r in range(len(ft_acc_values))], labels)
+
+        plt.legend()
+        plt.show()
 
     
 #######################################################
