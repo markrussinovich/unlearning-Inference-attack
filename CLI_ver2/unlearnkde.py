@@ -1,3 +1,8 @@
+# set this to true to have the unlearning algorithm include the test set in the MSE loss
+# to keep the model's behavior on the test set as close to that of the pretreained model
+# as possible
+include_testset_in_mse_loss = True
+
 import requests
 import copy
 import numpy as np
@@ -257,7 +262,12 @@ def unlearning(net, retain, forget, validation):
     # concatenate retain and forget sets
     retain_dataset_tagged = TaggedDataset(retain_stable, torch.tensor([0] * len(retain_stable)))
     forget_dataset_tagged = TaggedDataset(test_forget, torch.tensor([1] * len(test_forget)))
-    train_set = torch.utils.data.ConcatDataset([retain_dataset_tagged, forget_dataset_tagged])
+    if include_testset_in_mse_loss:
+        test_stable = update_retain_targets(net, validation)
+        test_dataset_tagged = TaggedDataset(test_stable, torch.tensor([0] * len(test_stable)))
+        train_set = torch.utils.data.ConcatDataset([retain_dataset_tagged, forget_dataset_tagged, test_dataset_tagged])
+    else:    
+        train_set = torch.utils.data.ConcatDataset([retain_dataset_tagged, forget_dataset_tagged])
 
     # shuffle the data
     print( "Shuffling the data")
